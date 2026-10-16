@@ -1186,8 +1186,21 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
     cbm_registry_add_lang(r, name, qualified_name, label, CBM_LANG_COUNT);
 }
 
+static void registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
+                         const char *label, CBMLanguage lang, bool by_name);
+
 void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qualified_name,
                            const char *label, CBMLanguage lang) {
+    registry_add(r, name, qualified_name, label, lang, true);
+}
+
+void cbm_registry_add_qn_only(cbm_registry_t *r, const char *qualified_name, const char *label,
+                              CBMLanguage lang) {
+    registry_add(r, NULL, qualified_name, label, lang, false);
+}
+
+static void registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
+                         const char *label, CBMLanguage lang, bool by_name) {
     if (!r || !qualified_name || !label) {
         return;
     }
@@ -1219,6 +1232,9 @@ void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qual
      * of a second strdup — this pair of copies was ~280 MB on the kernel. */
     cbm_ht_set(r->exact, strdup(qualified_name), (void *)interned);
     const char *owned_qn = cbm_ht_get_key(r->exact, qualified_name);
+    if (!by_name) {
+        return;
+    }
 
     /* Index the symbol under the QN's last dot segment, and additionally under
      * the name its caller passed when that segment carries a '#' fence.
