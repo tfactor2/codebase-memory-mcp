@@ -102,6 +102,8 @@ typedef struct {
     /* Callable identity (#2061): signature suffix of this def's graph QN;
      * qualified_name stays the base QN. NULL = none (always, until enabled). */
     const char *sig;
+    /* Java-only type parameters of a generic type, as written ("<K, V>"). */
+    const char *type_params;
 } CBMLSPDef;
 
 // Parse source, build registry from defs + stdlib, run LSP.

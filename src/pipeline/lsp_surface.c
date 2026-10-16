@@ -33,7 +33,7 @@
 #include "pipeline/worker_pool.h"
 #include "yyjson/yyjson.h"
 
-enum { SURFACE_CODEC_VERSION = 2 };
+enum { SURFACE_CODEC_VERSION = 3 };
 
 /* Labels the incremental name registry serves that pxc_map_label does NOT
  * carry into the CBMLSPDef set. Their (name, qn, label) triple must still
@@ -392,6 +392,7 @@ static char *surface_file_to_json(const CBMFileResult *result, CBMLanguage langu
         yyjson_mut_obj_add_bool(doc, o, "ir", d->is_rust_impl_relation);
         yyjson_mut_obj_add_bool(doc, o, "ab", d->is_abstract);
         add_str_array_or_null(doc, o, "dec", d->decorators, -1);
+        add_str_or_null(doc, o, "tp", d->type_params);
         yyjson_mut_arr_add_val(lsp, o);
     }
     yyjson_mut_obj_add_val(doc, root, "lsp", lsp);
@@ -668,6 +669,7 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
         d->is_abstract = yyjson_get_bool(yyjson_obj_get(o, "ab"));
         int dec_count = 0;
         d->decorators = arena_str_array(arena, yyjson_obj_get(o, "dec"), true, &dec_count);
+        d->type_params = arena_str_or_null(arena, yyjson_obj_get(o, "tp"));
         if (!d->qualified_name || !d->short_name || !d->label) {
             /* A def the writer could not have produced: qn/sn/label are
              * unconditionally present in build_lsp_def output. Corrupt row. */

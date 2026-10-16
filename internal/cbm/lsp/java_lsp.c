@@ -76,6 +76,7 @@ static const CBMType *resolve_identifier_type(JavaLSPContext *ctx, const char *n
 static const CBMType *resolve_member_type(JavaLSPContext *ctx, const CBMType *recv_type,
                                           const char *member_name);
 static void resolve_method_call(JavaLSPContext *ctx, TSNode call);
+static const char **java_type_param_names(CBMArena *a, const char *text);
 static void register_local_func_or_type_from_file(JavaLSPContext *ctx, CBMTypeRegistry *reg,
                                                   CBMFileResult *result);
 static const char *strip_generics(CBMArena *a, const char *type_text);
@@ -945,9 +946,38 @@ const CBMRegisteredFunc *java_lookup_method(JavaLSPContext *ctx, const char *cla
                                             const char *method_name, int arg_count) {
     if (!class_qn || !method_name)
         return NULL;
-    const char *cur = class_qn;
+    /* The superclass chain first, as Java's own lookup does: a concrete
+     * method two classes up beats an abstract one on an interface. */
     const CBMRegisteredFunc *fallback = NULL;
-    for (int hops = 0; hops < JAVA_LSP_MAX_INHERIT_HOPS && cur; hops++) {
+    const char *cur = class_qn;
+    for (int hop = 0; cur && hop < JAVA_LSP_MAX_INHERIT_HOPS; hop++) {
+        const CBMRegisteredFunc *m =
+            cbm_registry_lookup_method_by_args(ctx->registry, cur, method_name, arg_count);
+        if (m)
+            return m;
+        if (!fallback) {
+            fallback = cbm_registry_lookup_method(ctx->registry, cur, method_name);
+        }
+        const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, cur);
+        const char *super = NULL;
+        for (int i = 0; rt && rt->embedded_types && rt->embedded_types[i] && !super; i++) {
+            const CBMRegisteredType *st =
+                cbm_registry_lookup_type(ctx->registry, rt->embedded_types[i]);
+            if (st && !st->is_interface) {
+                super = rt->embedded_types[i];
+            }
+        }
+        cur = super;
+    }
+    /* Then breadth-first over every implemented interface too: a default
+     * method, or an abstract one a call on the class must still reach, sits on
+     * the second or later supertype as often as on the first. */
+    const char *queue[JAVA_LSP_MAX_INHERIT_HOPS];
+    int head = 0;
+    int tail = 0;
+    queue[tail++] = class_qn;
+    while (head < tail) {
+        cur = queue[head++];
         /* Try arg-count-aware lookup first. */
         const CBMRegisteredFunc *m =
             cbm_registry_lookup_method_by_args(ctx->registry, cur, method_name, arg_count);
@@ -958,12 +988,14 @@ const CBMRegisteredFunc *java_lookup_method(JavaLSPContext *ctx, const char *cla
             fallback = cbm_registry_lookup_method(ctx->registry, cur, method_name);
         }
         const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, cur);
-        if (!rt)
-            break;
-        if (rt->embedded_types && rt->embedded_types[0]) {
-            cur = rt->embedded_types[0];
-        } else {
-            cur = NULL;
+        for (int i = 0; rt && rt->embedded_types && rt->embedded_types[i]; i++) {
+            bool seen = false;
+            for (int j = 0; j < tail && !seen; j++) {
+                seen = strcmp(queue[j], rt->embedded_types[i]) == 0;
+            }
+            if (!seen && tail < JAVA_LSP_MAX_INHERIT_HOPS) {
+                queue[tail++] = rt->embedded_types[i];
+            }
         }
     }
     return fallback;
@@ -973,6 +1005,30 @@ const CBMRegisteredFunc *java_lookup_method(JavaLSPContext *ctx, const char *cla
  * stamp namespace_qn on every project type; the JDK seed leaves it NULL. */
 static bool java_is_project_type(const CBMRegisteredType *rt) {
     return rt && rt->namespace_qn && rt->namespace_qn[0];
+}
+
+/* `Repo<Invoice>.find` declared `Optional<T> find(..)`: bind the declaring
+ * class's type parameters to the receiver's type arguments. Only when the
+ * method is the receiver type's own: an inherited one is declared against
+ * its supertype's parameters, which the receiver's arguments need not match
+ * in number or order (`Sub<A, B> extends Base<B>`). */
+static const CBMType *java_bind_receiver_args(JavaLSPContext *ctx, const CBMRegisteredFunc *f,
+                                              const CBMType *recv, const CBMType *ret) {
+    if (!f || !f->receiver_type || !recv || recv->kind != CBM_TYPE_TEMPLATE || !ret)
+        return ret;
+    if (!recv->data.template_type.template_name ||
+        strcmp(recv->data.template_type.template_name, f->receiver_type) != 0)
+        return ret;
+    const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, f->receiver_type);
+    if (!rt || !rt->type_param_names || !recv->data.template_type.template_args)
+        return ret;
+    int names = 0;
+    while (rt->type_param_names[names])
+        names++;
+    if (names != recv->data.template_type.arg_count)
+        return ret;
+    return cbm_type_substitute(ctx->arena, ret, rt->type_param_names,
+                               recv->data.template_type.template_args);
 }
 
 /* ── Method-invocation evaluation ─────────────────────────────────── */
@@ -1102,6 +1158,111 @@ static const CBMType *substitute_generic_return(JavaLSPContext *ctx, const char 
     return fallback;
 }
 
+/* The value a one-argument function argument yields for an element of type
+ * `elem`: `Invoice::getCustomer` -> Customer, `x -> x.getName()` -> String.
+ * Unknown when it cannot be told cheaply (block bodies, overloads). */
+static const CBMType *java_function_arg_result(JavaLSPContext *ctx, TSNode fn,
+                                               const CBMType *elem) {
+    const char *kind = ts_node_type(fn);
+    if (strcmp(kind, "method_reference") == 0) {
+        uint32_t nc = ts_node_named_child_count(fn);
+        if (nc < 2) {
+            return cbm_type_unknown();
+        }
+        TSNode lhs = ts_node_named_child(fn, 0);
+        char *m = java_node_text(ctx, ts_node_named_child(fn, nc - 1));
+        if (!m) {
+            return cbm_type_unknown();
+        }
+        const char *owner = NULL;
+        int arity = 1;
+        if (strcmp(ts_node_type(lhs), "identifier") == 0 ||
+            strcmp(ts_node_type(lhs), "type_identifier") == 0 ||
+            strcmp(ts_node_type(lhs), "scoped_type_identifier") == 0) {
+            char *ln = java_node_text(ctx, lhs);
+            if (ln && cbm_type_is_unknown(cbm_scope_lookup(ctx->current_scope, ln))) {
+                owner = java_resolve_type_name(ctx, ln);
+                arity = 0; /* Type::instanceMethod takes the element as receiver */
+            }
+        }
+        if (!owner) {
+            const CBMType *t = java_eval_expr_type(ctx, lhs);
+            owner = t && t->kind == CBM_TYPE_NAMED      ? t->data.named.qualified_name
+                    : t && t->kind == CBM_TYPE_TEMPLATE ? t->data.template_type.template_name
+                                                        : NULL;
+        }
+        if (!owner) {
+            return cbm_type_unknown();
+        }
+        const CBMRegisteredFunc *f = java_lookup_method(ctx, owner, m, arity);
+        if (!f && arity == 0) {
+            f = java_lookup_method(ctx, owner, m, 1); /* Type::staticMethod(elem) */
+        }
+        return f ? java_return_type_of(f) : cbm_type_unknown();
+    }
+    if (strcmp(kind, "lambda_expression") == 0) {
+        TSNode params = ts_node_child_by_field_name(fn, "parameters", 10);
+        TSNode body = ts_node_child_by_field_name(fn, "body", 4);
+        if (ts_node_is_null(body) || strcmp(ts_node_type(body), "block") == 0) {
+            return cbm_type_unknown();
+        }
+        TSNode pid = params;
+        if (!ts_node_is_null(params) && strcmp(ts_node_type(params), "identifier") != 0) {
+            pid = ts_node_named_child_count(params) == 1 ? ts_node_named_child(params, 0)
+                                                         : (TSNode){0};
+        }
+        if (ts_node_is_null(pid) || strcmp(ts_node_type(pid), "identifier") != 0) {
+            return cbm_type_unknown();
+        }
+        char *pname = java_node_text(ctx, pid);
+        if (!pname) {
+            return cbm_type_unknown();
+        }
+        CBMScope *saved = ctx->current_scope;
+        ctx->current_scope = cbm_scope_push(ctx->arena, saved);
+        cbm_scope_bind(ctx->current_scope, pname, elem ? elem : cbm_type_unknown());
+        const CBMType *t = java_eval_expr_type(ctx, body);
+        ctx->current_scope = saved;
+        return t;
+    }
+    return cbm_type_unknown();
+}
+
+/* `Optional<T>.map(f)` / `Stream<T>.map(f)` carry what f yields, not T, and
+ * flatMap carries the element of what f yields. Carrying T over (what the
+ * T0 propagation does for filter/sorted/peek) would type the next lambda's
+ * parameter wrongly and resolve its calls on the wrong class. */
+static const CBMType *java_mapped_carrier(JavaLSPContext *ctx, TSNode call, const CBMType *recv,
+                                          const char *mname, const CBMType *ret) {
+    bool flat = strcmp(mname, "flatMap") == 0;
+    if (!flat && strcmp(mname, "map") != 0) {
+        return ret;
+    }
+    const char *qn = recv->data.template_type.template_name;
+    if (strcmp(qn, "java.util.Optional") != 0 && strcmp(qn, "java.util.stream.Stream") != 0) {
+        return ret;
+    }
+    TSNode args = ts_node_child_by_field_name(call, "arguments", 9);
+    if (ts_node_is_null(args) || ts_node_named_child_count(args) != 1 ||
+        recv->data.template_type.arg_count < 1) {
+        return ret;
+    }
+    const CBMType *u = java_function_arg_result(ctx, ts_node_named_child(args, 0),
+                                                recv->data.template_type.template_args[0]);
+    if (flat) {
+        u = u && u->kind == CBM_TYPE_TEMPLATE && u->data.template_type.arg_count >= 1
+                ? u->data.template_type.template_args[0]
+                : cbm_type_unknown();
+    }
+    const CBMType **targs = (const CBMType **)cbm_arena_alloc(ctx->arena, 2 * sizeof(*targs));
+    if (!targs) {
+        return ret;
+    }
+    targs[0] = u ? u : cbm_type_unknown();
+    targs[1] = NULL;
+    return cbm_type_template(ctx->arena, qn, targs, 1);
+}
+
 static const CBMType *eval_method_invocation(JavaLSPContext *ctx, TSNode node) {
     TSNode obj = ts_node_child_by_field_name(node, "object", 6);
     TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
@@ -1172,7 +1333,7 @@ static const CBMType *eval_method_invocation(JavaLSPContext *ctx, TSNode node) {
         if (base_qn) {
             const CBMRegisteredFunc *f = java_lookup_method(ctx, base_qn, mname, arity);
             if (f) {
-                const CBMType *ret = java_return_type_of(f);
+                const CBMType *ret = java_bind_receiver_args(ctx, f, base, java_return_type_of(f));
                 /* Generic substitution + carrier propagation. */
                 const CBMType *subst = substitute_generic_return(
                     ctx, base_qn, mname, base->data.template_type.template_args,
@@ -1184,7 +1345,7 @@ static const CBMType *eval_method_invocation(JavaLSPContext *ctx, TSNode node) {
                 subst = propagate_template(ctx->arena, base_qn, mname,
                                            base->data.template_type.template_args,
                                            base->data.template_type.arg_count, subst);
-                return subst;
+                return java_mapped_carrier(ctx, node, base, mname, subst);
             }
         }
     }
@@ -1730,10 +1891,9 @@ static void java_process_class_decl(JavaLSPContext *ctx, TSNode node) {
     ctx->enclosing_class_short = saved_short;
 }
 
-void java_lsp_process_file(JavaLSPContext *ctx, TSNode root) {
-    if (ts_node_is_null(root))
-        return;
-    /* First scan: package_declaration + imports (already pushed via init). */
+/* package_declaration + imports. */
+static void java_lsp_scan_header(JavaLSPContext *ctx, TSNode root) {
+    ctx->header_scanned = true;
     uint32_t n = ts_node_named_child_count(root);
     for (uint32_t i = 0; i < n; i++) {
         TSNode c = ts_node_named_child(root, i);
@@ -1788,6 +1948,16 @@ void java_lsp_process_file(JavaLSPContext *ctx, TSNode root) {
             }
         }
     }
+}
+
+void java_lsp_process_file(JavaLSPContext *ctx, TSNode root) {
+    if (ts_node_is_null(root))
+        return;
+    /* First scan: package_declaration + imports (already pushed via init). */
+    if (!ctx->header_scanned) {
+        java_lsp_scan_header(ctx, root);
+    }
+    uint32_t n = ts_node_named_child_count(root);
 
     /* Second scan: top-level type declarations. */
     for (uint32_t i = 0; i < n; i++) {
@@ -3137,6 +3307,42 @@ static void java_resolve_calls_in_node_inner(JavaLSPContext *ctx, TSNode node) {
 
 /* ── File-defs registration ───────────────────────────────────────── */
 
+static bool java_ident_char(char c) {
+    return isalnum((unsigned char)c) || c == '_' || c == '$';
+}
+
+const char *java_lsp_qualify_type_text(CBMArena *arena, const char *text, const char *const *names,
+                                       const char *const *paths, int count) {
+    if (!text || !text[0] || count == 0)
+        return text;
+    char buf[JAVA_LSP_BUF];
+    size_t w = 0;
+    bool changed = false;
+    for (const char *p = text; *p;) {
+        const char *e = p;
+        while (java_ident_char(*e))
+            e++;
+        const char *path = NULL;
+        if (e > p && !isdigit((unsigned char)*p) && (p == text || p[-1] != '.')) {
+            size_t len = (size_t)(e - p);
+            for (int i = 0; i < count && !path; i++) {
+                if (strlen(names[i]) == len && strncmp(names[i], p, len) == 0)
+                    path = paths[i];
+            }
+        }
+        const char *src = path ? path : p;
+        size_t n = path ? strlen(path) : (e > p ? (size_t)(e - p) : 1);
+        if (w + n >= sizeof(buf))
+            return text;
+        memcpy(buf + w, src, n);
+        w += n;
+        p += e > p ? (size_t)(e - p) : 1;
+        changed |= path != NULL;
+    }
+    buf[w] = '\0';
+    return changed ? cbm_arena_strdup(arena, buf) : text;
+}
+
 /* Parse a comma-separated list at the outermost generic level of `text`.
  * `text` is the substring INSIDE the angle brackets, e.g. for
  * "Map<String, List<Integer>>" the caller would pass "String, List<Integer>".
@@ -3349,6 +3555,7 @@ static void register_local_func_or_type_from_file(JavaLSPContext *ctx, CBMTypeRe
         stub.namespace_qn = (ctx->package_name && ctx->package_name[0]) ? ctx->package_name
                             : (module_qn && module_qn[0])               ? module_qn
                                                                         : d->qualified_name;
+        stub.type_param_names = java_type_param_names(a, d->type_params);
         cbm_registry_add_type(reg, stub);
     }
 
@@ -3440,6 +3647,11 @@ static void register_local_func_or_type_from_file(JavaLSPContext *ctx, CBMTypeRe
                                 cur = cbm_arena_strndup(a, cur, (size_t)(last_dot - cur));
                             }
                         }
+                        if (!resolved) {
+                            /* An import, the package, or the sole project type
+                             * of that name (cross-file run: the shared base). */
+                            resolved = java_resolve_type_name(ctx, no_gen);
+                        }
                         if (!resolved && module_qn && module_qn[0]) {
                             resolved = cbm_arena_sprintf(a, "%s.%s", module_qn, no_gen);
                         }
@@ -3470,7 +3682,10 @@ static void register_local_func_or_type_from_file(JavaLSPContext *ctx, CBMTypeRe
      * since CBMDefinition doesn't carry a per-field type for Java. See
      * register_class_field_in_registry below. */
 
-    /* Register methods. */
+    /* Register methods. A bare type in a signature is a package sibling once
+     * the package is known (cross-file run); else the path-derived module. */
+    const char *type_scope =
+        (ctx->package_name && ctx->package_name[0]) ? ctx->package_name : module_qn;
     for (int i = 0; i < result->defs.count; i++) {
         CBMDefinition *d = &result->defs.items[i];
         if (!d->qualified_name || !d->name || !d->label)
@@ -3494,7 +3709,7 @@ static void register_local_func_or_type_from_file(JavaLSPContext *ctx, CBMTypeRe
         if (d->signature_param_types || d->signature_param_count > 0) {
             JavaSignatureParseContext parse_ctx = {
                 .parent_class = parent,
-                .module_qn = module_qn,
+                .module_qn = type_scope,
                 .registry = reg,
             };
             ptypes = cbm_type_materialize_signature_params(a, d->signature_param_types,
@@ -3513,7 +3728,7 @@ static void register_local_func_or_type_from_file(JavaLSPContext *ctx, CBMTypeRe
                         (const CBMType **)cbm_arena_alloc(a, (size_t)(pc + 1) * sizeof(*ptypes));
                     for (int j = 0; j < pc; j++) {
                         ptypes[j] =
-                            parse_param_text_full(a, d->param_types[j], parent, module_qn, reg);
+                            parse_param_text_full(a, d->param_types[j], parent, type_scope, reg);
                     }
                     ptypes[pc] = NULL;
                 }
@@ -3524,11 +3739,11 @@ static void register_local_func_or_type_from_file(JavaLSPContext *ctx, CBMTypeRe
         const CBMType **rtypes = NULL;
         if (d->return_type && d->return_type[0]) {
             rtypes = (const CBMType **)cbm_arena_alloc(a, 2 * sizeof(*rtypes));
-            rtypes[0] = parse_param_text_full(a, d->return_type, parent, module_qn, reg);
+            rtypes[0] = parse_param_text_full(a, d->return_type, parent, type_scope, reg);
             rtypes[1] = NULL;
         } else if (d->return_types && d->return_types[0]) {
             rtypes = (const CBMType **)cbm_arena_alloc(a, 2 * sizeof(*rtypes));
-            rtypes[0] = parse_param_text_full(a, d->return_types[0], parent, module_qn, reg);
+            rtypes[0] = parse_param_text_full(a, d->return_types[0], parent, type_scope, reg);
             rtypes[1] = NULL;
         }
         rf.signature = cbm_type_func(a, param_names, ptypes, rtypes);
@@ -3862,6 +4077,45 @@ void cbm_run_java_lsp(CBMArena *arena, CBMFileResult *result, const char *source
 
 /* ── Cross-file LSP ───────────────────────────────────────────────── */
 
+/* "<K, V extends Comparable<V>>" -> {"K", "V", NULL}; NULL when there are no
+ * type parameters. Annotations on a parameter (`<@NonNull T>`) are skipped. */
+static const char **java_type_param_names(CBMArena *a, const char *text) {
+    if (!text || text[0] != '<')
+        return NULL;
+    enum { MAX_TYPE_PARAMS = 16 };
+    const char *names[MAX_TYPE_PARAMS];
+    int n = 0;
+    int depth = 0;
+    bool want = false;
+    for (const char *p = text; *p && n < MAX_TYPE_PARAMS; p++) {
+        if (*p == '<') {
+            want = ++depth == 1;
+        } else if (*p == '>') {
+            depth--;
+        } else if (depth == 1 && *p == ',') {
+            want = true;
+        } else if (depth == 1 && want && *p == '@') {
+            while (p[1] && (isalnum((unsigned char)p[1]) || p[1] == '_' || p[1] == '.'))
+                p++;
+        } else if (depth == 1 && want && (isalpha((unsigned char)*p) || *p == '_')) {
+            const char *e = p;
+            while (*e && (isalnum((unsigned char)*e) || *e == '_'))
+                e++;
+            names[n++] = cbm_arena_strndup(a, p, (size_t)(e - p));
+            want = false;
+            p = e - 1;
+        }
+    }
+    if (n == 0)
+        return NULL;
+    const char **out = (const char **)cbm_arena_alloc(a, (size_t)(n + 1) * sizeof(*out));
+    if (!out)
+        return NULL;
+    memcpy(out, names, (size_t)n * sizeof(*out));
+    out[n] = NULL;
+    return out;
+}
+
 void cbm_java_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const CBMLSPDef *defs,
                                 int def_count) {
     for (int i = 0; i < def_count; i++) {
@@ -3880,6 +4134,7 @@ void cbm_java_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const CBM
             rt.namespace_qn = (d->namespace_name && d->namespace_name[0]) ? d->namespace_name
                               : (d->def_module_qn && d->def_module_qn[0]) ? d->def_module_qn
                                                                           : d->qualified_name;
+            rt.type_param_names = java_type_param_names(arena, d->type_params);
             /* Embedded types from "|"-separated text. */
             if (d->embedded_types && d->embedded_types[0]) {
                 int n = 1;
@@ -3913,9 +4168,13 @@ void cbm_java_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const CBM
             rf.short_name = d->short_name;
             rf.min_params = -1;
             rf.receiver_type = d->receiver_type;
+            /* JVM defs are package-qualified: a bare type in a signature is a
+             * sibling in the package, not a path under the file's module. */
+            const char *type_scope =
+                (d->namespace_name && d->namespace_name[0]) ? d->namespace_name : d->def_module_qn;
             JavaSignatureParseContext parse_ctx = {
                 .parent_class = d->receiver_type,
-                .module_qn = d->def_module_qn,
+                .module_qn = type_scope,
                 .registry = reg,
             };
             const CBMType **ptypes = cbm_type_materialize_signature_params(
@@ -3932,7 +4191,7 @@ void cbm_java_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const CBM
                 } else {
                     first = no_pipe;
                 }
-                ret = parse_param_text(arena, first, d->def_module_qn);
+                ret = parse_param_text_full(arena, first, d->receiver_type, type_scope, reg);
             }
             const CBMType **rtypes = NULL;
             if (ret) {
@@ -3960,6 +4219,28 @@ void cbm_java_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const CBM
 /* Declared in src/pipeline/pass_lsp_cross.h; extern'd here to keep the
  * internal/cbm layer free of src/pipeline includes. */
 extern void cbm_pxc_count_perfile_defs(uint64_t defs);
+
+/* Cross defs carry supertypes as written, import-qualified by the collector
+ * (`Base`, `com.acme.model.Base`). Qualify the bare ones the way javac does —
+ * enclosing classes, then the package, then java.lang — once every type is
+ * registered, so java_lookup_method can walk them. */
+static void java_qualify_supertypes(CBMArena *arena, CBMTypeRegistry *reg) {
+    for (int i = 0; i < reg->type_count; i++) {
+        CBMRegisteredType *t = &reg->types[i];
+        if (!java_is_project_type(t) || !t->embedded_types)
+            continue;
+        for (int j = 0; t->embedded_types[j]; j++) {
+            const CBMType *bt = parse_param_text_full(arena, t->embedded_types[j],
+                                                      t->qualified_name, t->namespace_qn, reg);
+            const char *qn = bt->kind == CBM_TYPE_NAMED      ? bt->data.named.qualified_name
+                             : bt->kind == CBM_TYPE_TEMPLATE ? bt->data.template_type.template_name
+                                                             : NULL;
+            if (qn) {
+                ((const char **)t->embedded_types)[j] = qn;
+            }
+        }
+    }
+}
 
 CBMTypeRegistry *cbm_java_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, int def_count) {
     if (!arena) {
@@ -4019,6 +4300,7 @@ CBMTypeRegistry *cbm_java_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
     }
     cbm_java_register_lsp_defs(arena, reg, jvm, type_count);
     cbm_registry_finalize(reg);
+    java_qualify_supertypes(arena, reg);
     if (total > type_count) { /* jvm is NULL for an empty corpus: no offset */
         cbm_java_register_lsp_defs(arena, reg, jvm + type_count, total - type_count);
     }
@@ -4057,6 +4339,35 @@ void cbm_run_java_lsp_cross_with_registry(CBMArena *arena, CBMFileResult *result
     JavaLSPContext ctx;
     java_lsp_init(&ctx, arena, source, source_len, &overlay, NULL, module_qn, out);
 
+    TSTree *tree = cached_tree;
+    bool owns_tree = false;
+    if (!tree) {
+        TSParser *parser = ts_parser_new();
+        if (!parser) {
+            return;
+        }
+        ts_parser_set_language(parser, tree_sitter_java());
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
+        ts_parser_delete(parser);
+        owns_tree = true;
+    }
+    if (!tree) {
+        return;
+    }
+    TSNode root = ts_tree_root_node(tree);
+
+    /* Imports as written come first: the shared registry is package-
+     * qualified, and the pipeline's import map names graph nodes (a file or
+     * module QN), which would shadow `com.acme.Repo` for the local `Repo`.
+     * A caller entry is kept only when it names a registered type. */
+    java_lsp_scan_header(&ctx, root);
+    for (int i = 0; i < import_count; i++) {
+        if (!import_names[i] || !import_qns[i] || !cbm_registry_lookup_type(reg, import_qns[i])) {
+            continue;
+        }
+        java_lsp_add_import(&ctx, import_names[i], import_qns[i], CBM_JAVA_IMPORT_TYPE);
+    }
+
     register_local_func_or_type_from_file(&ctx, &overlay, result);
     cbm_pxc_count_perfile_defs((uint64_t)result->defs.count);
 
@@ -4066,32 +4377,6 @@ void cbm_run_java_lsp_cross_with_registry(CBMArena *arena, CBMFileResult *result
     CBMArena idx_arena;
     cbm_arena_init(&idx_arena);
     cbm_registry_finalize_into(&overlay, &idx_arena);
-
-    TSTree *tree = cached_tree;
-    bool owns_tree = false;
-    if (!tree) {
-        TSParser *parser = ts_parser_new();
-        if (!parser) {
-            cbm_arena_destroy(&idx_arena);
-            return;
-        }
-        ts_parser_set_language(parser, tree_sitter_java());
-        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
-        ts_parser_delete(parser);
-        owns_tree = true;
-    }
-    if (!tree) {
-        cbm_arena_destroy(&idx_arena);
-        return;
-    }
-    TSNode root = ts_tree_root_node(tree);
-
-    for (int i = 0; i < import_count; i++) {
-        if (!import_names[i] || !import_qns[i]) {
-            continue;
-        }
-        java_lsp_add_import(&ctx, import_names[i], import_qns[i], CBM_JAVA_IMPORT_TYPE);
-    }
 
     java_lsp_process_file(&ctx, root);
     cbm_arena_destroy(&idx_arena);
@@ -4103,7 +4388,8 @@ void cbm_run_java_lsp_cross_with_registry(CBMArena *arena, CBMFileResult *result
 
 /* The per-file fallback when no shared cross registry was built. Its
  * registry has no fallback layer, so java_receiver_is_external never fires
- * here: library calls keep the textual registry fallback, as before. */
+ * here (library calls keep the textual registry fallback, as before), and the
+ * header is read by the walk itself rather than ahead of registration. */
 void cbm_run_java_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             const char *module_qn, CBMLSPDef *defs, int def_count,
                             const char **import_names, const char **import_qns, int import_count,

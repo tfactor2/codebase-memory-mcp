@@ -93,6 +93,10 @@ typedef struct {
     /* Debug mode (CBM_LSP_DEBUG env). */
     bool debug;
 
+    /* The package declaration and imports were read before the walk (the
+     * cross-file run needs them to qualify its own types' supertypes). */
+    bool header_scanned;
+
     /* java_receiver_is_external's answers for the packages probed so far
      * (a few per file), so each costs one registry walk. */
     const char *ext_memo_pkg[JAVA_EXT_MEMO];
@@ -108,6 +112,15 @@ void java_lsp_init(JavaLSPContext *ctx, CBMArena *arena, const char *source, int
 
 void java_lsp_add_import(JavaLSPContext *ctx, const char *local_name, const char *target_qn,
                          int kind);
+
+/* A Java type spelling with every simple name the file's import table binds
+ * replaced by its import (`Optional<Customer>` →
+ * `java.util.Optional<com.acme.model.Customer>`); `names[i]` binds to
+ * `paths[i]`. A name after a '.' is already qualified and stays. Returns
+ * `text` itself when nothing is bound, or when the result would not fit a
+ * type spelling's buffer. */
+const char *java_lsp_qualify_type_text(CBMArena *arena, const char *text, const char *const *names,
+                                       const char *const *paths, int count);
 
 /* ── Walking / resolution ─────────────────────────────────────────── */
 

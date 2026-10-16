@@ -313,6 +313,11 @@ typedef struct {
      * change of all, store_impact.h follow_variant_keys). NULL on every other
      * definition. Tail field: zero-init stays valid. */
     const char *variant_key;
+    /* Java only: a generic type's own type parameters as written
+     * ("<K, V extends Base<K>>"); NULL for non-generic types and every other
+     * language. The cross-file resolver binds a receiver's type arguments to
+     * these names. Tail field: zero-init stays valid. */
+    const char *type_params;
 } CBMDefinition;
 
 /* Argument captured from a call expression */
