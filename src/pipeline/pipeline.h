@@ -257,6 +257,13 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
 void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qualified_name,
                            const char *label, CBMLanguage lang);
 
+/* As cbm_registry_add_lang, but reachable by its QN only: the symbol joins no
+ * by-name bucket, so no bare-name guess can bind a call to it. For members
+ * with no declaration in the source (CBMDefinition.is_generated), which only
+ * the type-aware resolver may target. */
+void cbm_registry_add_qn_only(cbm_registry_t *r, const char *qualified_name, const char *label,
+                              CBMLanguage lang);
+
 /* True when code in `caller` can call a symbol defined in `target` by bare
  * name: same language, same interop family (JS/TS + script hosts, C/C++/CUDA/
  * ObjC, JVM, .NET, ...; the table lives in registry.c), or Swift with the C

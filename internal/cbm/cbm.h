@@ -298,9 +298,10 @@ typedef struct {
      * are bound to the owning result's source identity before cross-file use. */
     uint32_t test_name_start_byte, test_name_end_byte;
     uint32_t test_body_start_byte, test_body_end_byte;
-    /* Documents only: facts a document definition adds to its node's
-     * properties, as a NULL-terminated key, value, key, value, ... list (an
-     * ADR's id, status, date, deciders, title). Keys are fixed literals; the
+    /* Documents and Lombok-generated members only: facts a definition adds to
+     * its node's properties, as a NULL-terminated key, value, key, value, ...
+     * list (an ADR's id, status, date, deciders, title; a generated getter's
+     * `lombok` annotation and source `field`). Keys are fixed literals; the
      * values are escaped where the properties are written. Tail field:
      * zero-init stays valid. */
     const char **extra_props;
@@ -318,6 +319,11 @@ typedef struct {
      * language. The cross-file resolver binds a receiver's type arguments to
      * these names. Tail field: zero-init stays valid. */
     const char *type_params;
+    /* Java only: a member an annotation processor writes (Lombok,
+     * extract_lombok.c), with no declaration in the source. The registry files
+     * it by QN only: a call reaches it through the type-aware resolver, never
+     * by a bare-name guess. Tail field: zero-init stays valid. */
+    bool is_generated;
 } CBMDefinition;
 
 /* Argument captured from a call expression */
@@ -1343,6 +1349,11 @@ void cbm_extract_definitions_without_module(CBMExtractCtx *ctx);
 // per ref()/source() call. No-op unless the file parses as SQL and actually
 // contains a dbt builtin call. Defined in extract_dbt.c.
 void cbm_extract_dbt(CBMExtractCtx *ctx);
+
+/* Java: definitions for the members Lombok generates (extract_lombok.c). */
+void cbm_extract_lombok_members(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
+                                const char *class_name, const char **class_decorators,
+                                int fields_from);
 void cbm_extract_imports(CBMExtractCtx *ctx);
 void cbm_extract_usages(CBMExtractCtx *ctx);
 void cbm_extract_semantic(CBMExtractCtx *ctx);

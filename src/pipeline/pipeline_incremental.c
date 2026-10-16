@@ -1334,6 +1334,15 @@ static bool incr_label_is_registry_symbol(const char *label) {
  * language, so it comes from the current discovery (rel_path -> language);
  * synthetic LSP sources (<python-builtins>) map by their fixed path, which is
  * also why a builtin stub that outlives the last .py file stays Python. */
+/* A Lombok-generated method (CBMDefinition.is_generated) is seeded by QN only,
+ * as the full index does. Stored nodes keep no flag; the method's `lombok`
+ * property (extract_lombok.c) is the trace. The builder class it generates
+ * carries the property too, but is a type and stays reachable by name. */
+static bool incr_node_is_generated(const cbm_gbuf_node_t *node) {
+    return node->label && strcmp(node->label, "Method") == 0 && node->properties_json &&
+           strstr(node->properties_json, "\"lombok\":") != NULL;
+}
+
 typedef struct {
     cbm_registry_t *registry;
     CBMHashTable *lang_by_path; /* rel_path -> (CBMLanguage + 1); keys borrowed */
@@ -1351,7 +1360,11 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
             lang = (CBMLanguage)((uintptr_t)v - SKIP_ONE);
         }
     }
-    cbm_registry_add_lang(seed->registry, node->name, node->qualified_name, node->label, lang);
+    if (incr_node_is_generated(node)) {
+        cbm_registry_add_qn_only(seed->registry, node->qualified_name, node->label, lang);
+    } else {
+        cbm_registry_add_lang(seed->registry, node->name, node->qualified_name, node->label, lang);
+    }
 }
 
 /* Seed the registry from every registry symbol in the graph buffer, with
