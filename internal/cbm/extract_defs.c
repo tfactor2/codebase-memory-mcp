@@ -7959,7 +7959,7 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     // Extract class-level variables (field declarations not already Fields)
     extract_class_variables(ctx, node, class_qn, spec, fields_from);
 
-    // Lombok-generated accessors (Java only)
+    // Lombok-generated accessors and builders (Java only)
     cbm_extract_lombok_members(ctx, node, class_qn, name, def.decorators, fields_from);
 
     if (ctx->language == CBM_LANG_PYTHON) {

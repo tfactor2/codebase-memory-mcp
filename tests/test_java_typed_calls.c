@@ -6,9 +6,9 @@
  * InvoiceService are read back from the store. Each project method carries a
  * same-named decoy in an unrelated class (Filters), so a name-only guess is
  * visible as an edge to Filters. Covered:
- *   - Lombok @Data/@Getter/@Setter/@Value accessors, a hand-written getter
- *     beside @Data, a hand-written builder chain, and Spring's @Value, which
- *     is not Lombok's;
+ *   - Lombok @Data/@Getter/@Setter/@Value accessors and @Builder chains,
+ *     @Accessors(prefix), @Builder.Default, a hand-written builder class, and
+ *     Spring's @Value, which is not Lombok's;
  *   - receiver types of fields, parameters, `var x = new X()`, and the
  *     generic return of a project interface (Repo<Invoice>.first());
  *   - JDK and library receivers (Stream, org.jooq.DSLContext), whose calls
@@ -35,25 +35,11 @@
 
 static const char *const JT_INVOICE =
     "package com.acme.model;\n\n"
-    "import lombok.Data;\n\n"
-    "@Data\npublic class Invoice {\n"
+    "import lombok.Builder;\nimport lombok.Data;\n\n"
+    "@Data\n@Builder\npublic class Invoice {\n"
     "    private String number;\n"
     "    private boolean paid;\n"
-    "    private Customer customer;\n\n"
-    "    public Invoice(String number, boolean paid, Customer customer) {\n"
-    "        this.number = number;\n"
-    "        this.paid = paid;\n"
-    "        this.customer = customer;\n"
-    "    }\n\n"
-    "    public boolean isPaid() { return paid; }\n"
-    "    public static InvoiceBuilder builder() { return new InvoiceBuilder(); }\n\n"
-    "    public static class InvoiceBuilder {\n"
-    "        private String number;\n"
-    "        private boolean paid;\n"
-    "        public InvoiceBuilder number(String n) { this.number = n; return this; }\n"
-    "        public InvoiceBuilder paid(boolean p) { this.paid = p; return this; }\n"
-    "        public Invoice build() { return new Invoice(number, paid, null); }\n"
-    "    }\n"
+    "    private Customer customer;\n"
     "}\n";
 
 static const char *const JT_CUSTOMER =
@@ -86,6 +72,34 @@ static const char *const JT_BASE = "package com.acme.model;\n\n"
                                    "    public void audit() {}\n"
                                    "}\n";
 
+static const char *const JT_SETTINGS = "package com.acme.model;\n\n"
+                                       "import lombok.Getter;\n"
+                                       "import lombok.experimental.Accessors;\n\n"
+                                       "@Getter\n@Accessors(prefix = \"m\")\n"
+                                       "public class Settings {\n"
+                                       "    private String mLabel;\n"
+                                       "    private String mode;\n"
+                                       "}\n";
+
+static const char *const JT_ORDER =
+    "package com.acme.model;\n\n"
+    "import lombok.Builder;\n\n"
+    "@Builder\npublic class Order {\n"
+    "    @Builder.Default private final String state = \"new\";\n"
+    "    private final String id = \"x\";\n"
+    "    private String note;\n\n"
+    "    public static class OrderBuilder {\n"
+    "        public OrderBuilder note(String n) { this.note = n; return this; }\n"
+    "    }\n"
+    "}\n";
+
+/* @Builder on a record: the components are the builder's setters. */
+static const char *const JT_BASKET = "package com.acme.model;\n\n"
+                                     "import lombok.Builder;\n\n"
+                                     "@Builder\npublic record Basket(String currency, Long amount) {\n"
+                                     "    public static final Basket EMPTY = null;\n"
+                                     "}\n";
+
 /* Spring's @Value, with no Lombok import: no getter. */
 static const char *const JT_CONFIG =
     "package com.acme.other;\n\n"
@@ -113,9 +127,12 @@ static const char *const JT_FILTERS = "package com.acme.other;\n\n"
 static const char *const JT_SERVICE =
     "package com.acme.svc;\n\n"
     "import com.acme.model.Base;\n"
+    "import com.acme.model.Basket;\n"
     "import com.acme.model.Customer;\n"
     "import com.acme.model.Invoice;\n"
+    "import com.acme.model.Order;\n"
     "import com.acme.model.Repo;\n"
+    "import com.acme.model.Settings;\n"
     "import java.util.List;\n"
     "import java.util.stream.Collectors;\n"
     "import org.jooq.DSLContext;\n\n"
@@ -151,6 +168,15 @@ static const char *const JT_SERVICE =
     "    public String branchCity(com.acme.model.Branch b) {\n"
     "        return b.getCity();\n"
     "    }\n\n"
+    "    public Order order() {\n"
+    "        return Order.builder().state(\"a\").note(\"b\").build();\n"
+    "    }\n\n"
+    "    public Basket basket() {\n"
+    "        return Basket.builder().currency(\"EUR\").amount(1L).build();\n"
+    "    }\n\n"
+    "    public String label(Settings s) {\n"
+    "        return s.getLabel();\n"
+    "    }\n\n"
     "    public void raw(java.util.List items) {\n"
     "        items.forEach(x -> x.getNumber());\n"
     "    }\n"
@@ -162,6 +188,9 @@ static void jt_write_fixture(const char *tmp, int filler) {
     th_write_file(TH_PATH(tmp, "src/main/java/com/acme/model/Address.java"), JT_ADDRESS);
     th_write_file(TH_PATH(tmp, "src/main/java/com/acme/model/Repo.java"), JT_REPO);
     th_write_file(TH_PATH(tmp, "src/main/java/com/acme/model/Base.java"), JT_BASE);
+    th_write_file(TH_PATH(tmp, "src/main/java/com/acme/model/Settings.java"), JT_SETTINGS);
+    th_write_file(TH_PATH(tmp, "src/main/java/com/acme/model/Order.java"), JT_ORDER);
+    th_write_file(TH_PATH(tmp, "src/main/java/com/acme/model/Basket.java"), JT_BASKET);
     th_write_file(TH_PATH(tmp, "src/main/java/com/acme/other/Config.java"), JT_CONFIG);
     th_write_file(TH_PATH(tmp, "src/main/java/com/acme/other/Filters.java"), JT_FILTERS);
     th_write_file(TH_PATH(tmp, "src/main/java/com/acme/svc/InvoiceService.java"), JT_SERVICE);
@@ -378,7 +407,7 @@ static int jt_check_receivers(jt_index_t *ix) {
     return ok;
 }
 
-static int jt_check_builder(jt_index_t *ix) {
+static int jt_check_lombok_builder(jt_index_t *ix) {
     int ok = 1;
     ok &= jt_expect(ix, "make", "builder", "com.acme.model.Invoice.builder");
     ok &= jt_expect(ix, "make", "number", "com.acme.model.Invoice.InvoiceBuilder.number");
@@ -409,9 +438,13 @@ static int jt_check_external(jt_index_t *ix) {
 static int jt_check_lombok_nodes(jt_index_t *ix) {
     int ok = 1;
     const char *want[] = {
-        "com.acme.model.Invoice.getNumber",   "com.acme.model.Invoice.setPaid",
+        "com.acme.model.Invoice.getNumber",  "com.acme.model.Invoice.isPaid",
         "com.acme.model.Invoice.setCustomer", "com.acme.model.Customer.setName",
-        "com.acme.model.Address.getCity",
+        "com.acme.model.Address.getCity",    "com.acme.model.Invoice.InvoiceBuilder.build",
+        /* @Accessors(prefix = "m"): mLabel's getter drops the prefix. */
+        "com.acme.model.Settings.getLabel",
+        /* @Builder.Default keeps an initialised final field in the builder. */
+        "com.acme.model.Order.OrderBuilder.state",
     };
     for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
         if (jt_node(ix, want[i], NULL) != 1) {
@@ -420,11 +453,14 @@ static int jt_check_lombok_nodes(jt_index_t *ix) {
         }
     }
     /* Not generated: a setter on @Value, an accessor of an unannotated field,
-     * and a getter for Spring's @Value. */
+     * a field no @Accessors prefix matches, an initialised final field in a
+     * builder, and a getter for Spring's @Value. */
     const char *absent[] = {
-        "com.acme.model.Address.setCity",
-        "com.acme.model.Customer.getHidden",
-        "com.acme.other.Config.getInterval",
+        "com.acme.model.Address.setCity",   "com.acme.model.Customer.getHidden",
+        "com.acme.model.Settings.getMode",  "com.acme.model.Settings.getMLabel",
+        "com.acme.model.Order.OrderBuilder.id", "com.acme.other.Config.getInterval",
+        /* a record's static field is no component */
+        "com.acme.model.Basket.BasketBuilder.EMPTY",
     };
     for (size_t i = 0; i < sizeof(absent) / sizeof(absent[0]); i++) {
         if (jt_node(ix, absent[i], NULL) != 0) {
@@ -432,13 +468,30 @@ static int jt_check_lombok_nodes(jt_index_t *ix) {
             ok = 0;
         }
     }
-    /* The getter the source declares beside @Data stays the source's: one
-     * node, with no `lombok` property. */
-    int lombok = -1;
-    if (jt_node(ix, "com.acme.model.Invoice.isPaid", &lombok) != 1 || lombok != 0) {
-        printf("\n  Invoice.isPaid: want one declared node, no lombok property\n");
-        ok = 0;
+    /* The builder class the source declares, and its own note(), stay the
+     * source's: one node each, with no `lombok` property. */
+    const char *own[] = {"com.acme.model.Order.OrderBuilder",
+                         "com.acme.model.Order.OrderBuilder.note"};
+    for (size_t i = 0; i < sizeof(own) / sizeof(own[0]); i++) {
+        int lombok = -1;
+        if (jt_node(ix, own[i], &lombok) != 1 || lombok != 0) {
+            printf("\n  %s: want one declared node, no lombok property\n", own[i]);
+            ok = 0;
+        }
     }
+    return ok;
+}
+
+static int jt_check_lombok_options(jt_index_t *ix) {
+    int ok = 1;
+    ok &= jt_expect(ix, "label", "getLabel", "com.acme.model.Settings.getLabel");
+    ok &= jt_expect(ix, "order", "builder", "com.acme.model.Order.builder");
+    ok &= jt_expect(ix, "order", "state", "com.acme.model.Order.OrderBuilder.state");
+    ok &= jt_expect(ix, "order", "note", "com.acme.model.Order.OrderBuilder.note");
+    ok &= jt_expect(ix, "order", "build", "com.acme.model.Order.OrderBuilder.build");
+    ok &= jt_expect(ix, "basket", "currency", "com.acme.model.Basket.BasketBuilder.currency");
+    ok &= jt_expect(ix, "basket", "amount", "com.acme.model.Basket.BasketBuilder.amount");
+    ok &= jt_expect(ix, "basket", "build", "com.acme.model.Basket.BasketBuilder.build");
     return ok;
 }
 
@@ -452,7 +505,8 @@ static int jt_run_all(int filler) {
     int ok = 1;
     ok &= jt_check_lombok_nodes(&ix);
     ok &= jt_check_receivers(&ix);
-    ok &= jt_check_builder(&ix);
+    ok &= jt_check_lombok_builder(&ix);
+    ok &= jt_check_lombok_options(&ix);
     ok &= jt_check_external(&ix);
     jt_close(&ix);
     return ok;
