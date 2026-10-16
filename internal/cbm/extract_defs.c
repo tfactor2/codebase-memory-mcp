@@ -7932,6 +7932,14 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(ctx, node, name);
+    if (ctx->language == CBM_LANG_JAVA) {
+        /* `<K, V extends X>`: the cross-file registry binds a receiver's type
+         * arguments to these names. */
+        TSNode tparams = ts_node_child_by_field_name(node, TS_FIELD("type_parameters"));
+        if (!ts_node_is_null(tparams)) {
+            def.type_params = cbm_node_text(a, tparams, ctx->source);
+        }
+    }
 
     cbm_defs_push(&ctx->result->defs, a, def);
 

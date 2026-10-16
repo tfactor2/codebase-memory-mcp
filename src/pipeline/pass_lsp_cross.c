@@ -490,6 +490,9 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
             dst->decorators = decos;
         }
     }
+    if (lang == CBM_LANG_JAVA && src->type_params) {
+        dst->type_params = cbm_arena_strdup(arena, src->type_params);
+    }
     if (lang == CBM_LANG_RUST) {
         /* Exact impl-block provenance is captured while the Rust impl node is
          * still on hand.  Do not reconstruct it later from leaf names. */
@@ -497,6 +500,65 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
         dst->is_abstract = src->is_abstract;
     }
     return 0;
+}
+
+static const char *pxc_import_leaf(const char *path);
+static const char *pxc_unique_import_path(const CBMFileResult *result, const char *local_name,
+                                          bool *out_ambiguous);
+
+/* Java: qualify the type spellings of one file's cross defs by its imports.
+ * The registrar sees no imports, and the cross registry is package-qualified,
+ * so this is the one place an imported name can still be told from a
+ * same-package one. The table holds each simple name one single-type import
+ * binds unambiguously, in the registry's spelling (a nested `a.b.Outer.Inner`
+ * is registered as `a.b.Inner`), less the types the file declares itself,
+ * which shadow an import. Names it does not bind stay bare for the registrar
+ * to resolve against enclosing classes, the package and java.lang. */
+static void pxc_java_qualify_defs(CBMArena *arena, const CBMFileResult *result, CBMLSPDef *defs,
+                                  int start, int end) {
+    int n = result->imports.count;
+    if (n == 0) {
+        return;
+    }
+    const char **names = (const char **)cbm_arena_alloc(arena, (size_t)n * sizeof(*names));
+    const char **paths = (const char **)cbm_arena_alloc(arena, (size_t)n * sizeof(*paths));
+    int k = 0;
+    for (int i = 0; names && paths && i < n; i++) {
+        const char *name = result->imports.items[i].local_name;
+        bool ambiguous = false;
+        const char *path = name ? pxc_unique_import_path(result, name, &ambiguous) : NULL;
+        const char *leaf = pxc_import_leaf(path);
+        /* A capitalised leaf: `import static a.B.member;` binds no type. */
+        bool skip = !path || !leaf || strcmp(leaf, name) != 0 || leaf[0] < 'A' || leaf[0] > 'Z';
+        for (int j = 0; j < k && !skip; j++) {
+            skip = strcmp(names[j], name) == 0;
+        }
+        for (int d = 0; d < result->defs.count && !skip; d++) {
+            const CBMDefinition *own = &result->defs.items[d];
+            skip = own->name && cbm_label_is_type_like(own->label) && strcmp(own->name, name) == 0;
+        }
+        if (skip) {
+            continue;
+        }
+        /* The package ends before the first capitalised segment. */
+        const char *type = NULL;
+        for (const char *p = path; (p = strchr(p, '.')) != NULL && !type; p++) {
+            type = p[1] >= 'A' && p[1] <= 'Z' ? p + 1 : NULL;
+        }
+        names[k] = name;
+        paths[k++] = type && type != leaf ? cbm_arena_sprintf(arena, "%.*s.%s",
+                                                               (int)(type - 1 - path), path, leaf)
+                                          : path;
+    }
+    for (int i = start; i < end && k > 0; i++) {
+        CBMLSPDef *d = &defs[i];
+        d->return_types = java_lsp_qualify_type_text(arena, d->return_types, names, paths, k);
+        d->embedded_types = java_lsp_qualify_type_text(arena, d->embedded_types, names, paths, k);
+        for (int p = 0; p < d->signature_param_count; p++) {
+            d->signature_param_types[p] =
+                java_lsp_qualify_type_text(arena, d->signature_param_types[p], names, paths, k);
+        }
+    }
 }
 
 /* Go and C: fold per-field "Field" definitions into their owning type's
@@ -825,6 +887,9 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
             pxc_fold_py_field_types(arena, fr, defs, file_start, idx, &bs, def_modules[fi]);
         }
         cbm_pxc_free_import_map(bs.imp_keys, bs.imp_vals, bs.imp_count); /* NULL-safe */
+        if (files[fi].language == CBM_LANG_JAVA) {
+            pxc_java_qualify_defs(arena, fr, defs, file_start, idx);
+        }
         if (files[fi].language == CBM_LANG_GO) {
             pxc_fold_struct_fields(arena, fr, defs, file_start, idx, "Struct");
         } else if (files[fi].language == CBM_LANG_C || files[fi].language == CBM_LANG_CPP) {

@@ -6,9 +6,12 @@
  * InvoiceService are read back from the store. Each project method carries a
  * same-named decoy in an unrelated class (Filters), so a name-only guess is
  * visible as an edge to Filters. Covered:
- *   - JDK and library receivers (Stream, List, org.jooq.DSLContext), whose
- *     calls get no edge instead of a project method of the same name;
- *   - a project receiver, whose call keeps its edge;
+ *   - getters and a builder chain;
+ *   - receiver types of fields, parameters, `var x = new X()`, and the
+ *     generic return of a project interface (Repo<Invoice>.first()), with
+ *     every type imported from another package;
+ *   - JDK and library receivers (Stream, org.jooq.DSLContext), whose calls
+ *     get no edge instead of a project method of the same name;
  *   - a receiver whose type is missing from the graph but whose package is
  *     the project's (a generated class that was not indexed, spelled with
  *     its package): unknown, not external, so its call keeps the name
@@ -28,10 +31,62 @@
 
 /* ── Fixture ─────────────────────────────────────────────────────── */
 
-static const char *const JT_CUSTOMER = "package com.acme.model;\n\n"
-                                       "public class Customer {\n"
-                                       "    public String getName() { return \"\"; }\n"
-                                       "}\n";
+static const char *const JT_INVOICE =
+    "package com.acme.model;\n\n"
+    "public class Invoice {\n"
+    "    private String number;\n"
+    "    private boolean paid;\n"
+    "    private Customer customer;\n\n"
+    "    public Invoice(String number, boolean paid, Customer customer) {\n"
+    "        this.number = number;\n"
+    "        this.paid = paid;\n"
+    "        this.customer = customer;\n"
+    "    }\n\n"
+    "    public String getNumber() { return number; }\n"
+    "    public boolean isPaid() { return paid; }\n"
+    "    public Customer getCustomer() { return customer; }\n"
+    "    public void setPaid(boolean paid) { this.paid = paid; }\n"
+    "    public static InvoiceBuilder builder() { return new InvoiceBuilder(); }\n\n"
+    "    public static class InvoiceBuilder {\n"
+    "        private String number;\n"
+    "        private boolean paid;\n"
+    "        public InvoiceBuilder number(String n) { this.number = n; return this; }\n"
+    "        public InvoiceBuilder paid(boolean p) { this.paid = p; return this; }\n"
+    "        public Invoice build() { return new Invoice(number, paid, null); }\n"
+    "    }\n"
+    "}\n";
+
+static const char *const JT_CUSTOMER =
+    "package com.acme.model;\n\n"
+    "public class Customer {\n"
+    "    private String name;\n"
+    "    private Address address;\n\n"
+    "    public String getName() { return name; }\n"
+    "    public void setName(String name) { this.name = name; }\n"
+    "    public Address getAddress() { return address; }\n"
+    "    public String describe() { return name; }\n"
+    "    public String describe(String prefix) { return prefix + name; }\n"
+    "}\n";
+
+static const char *const JT_ADDRESS = "package com.acme.model;\n\n"
+                                      "public final class Address {\n"
+                                      "    private final String city;\n\n"
+                                      "    public Address(String city) { this.city = city; }\n"
+                                      "    public String getCity() { return city; }\n"
+                                      "}\n";
+
+static const char *const JT_REPO = "package com.acme.model;\n\n"
+                                   "import java.util.List;\nimport java.util.Optional;\n\n"
+                                   "public interface Repo<T> {\n"
+                                   "    Optional<T> find(String id);\n"
+                                   "    List<T> all();\n"
+                                   "    T first();\n"
+                                   "}\n";
+
+static const char *const JT_BASE = "package com.acme.model;\n\n"
+                                   "public abstract class Base {\n"
+                                   "    public void audit() {}\n"
+                                   "}\n";
 
 /* Every method here shares a name with a real target elsewhere. */
 static const char *const JT_FILTERS = "package com.acme.other;\n\n"
@@ -50,25 +105,41 @@ static const char *const JT_FILTERS = "package com.acme.other;\n\n"
 
 static const char *const JT_SERVICE =
     "package com.acme.svc;\n\n"
+    "import com.acme.model.Base;\n"
     "import com.acme.model.Customer;\n"
+    "import com.acme.model.Invoice;\n"
+    "import com.acme.model.Repo;\n"
     "import java.util.List;\n"
     "import java.util.stream.Collectors;\n"
     "import org.jooq.DSLContext;\n\n"
-    "public class InvoiceService {\n"
+    "public class InvoiceService extends Base {\n"
+    "    private final Repo<Invoice> invoices;\n"
     "    private final DSLContext dsl;\n\n"
-    "    public InvoiceService(DSLContext dsl) {\n"
+    "    public InvoiceService(Repo<Invoice> invoices, DSLContext dsl) {\n"
+    "        this.invoices = invoices;\n"
     "        this.dsl = dsl;\n"
     "    }\n\n"
-    "    public List<String> numbers(List<String> names) {\n"
-    "        return names.stream().filter(n -> n.isEmpty()).map(n -> n.trim())\n"
+    "    public String customerName(String id) {\n"
+    "        return invoices.find(id).map(c -> c.getCustomer().getName()).orElse(\"\");\n"
+    "    }\n\n"
+    "    public String city() {\n"
+    "        return invoices.first().getCustomer().getAddress().getCity();\n"
+    "    }\n\n"
+    "    public List<String> numbers() {\n"
+    "        return invoices.all().stream().filter(i -> i.isPaid()).map(Invoice::getNumber)\n"
     "                .collect(Collectors.toList());\n"
     "    }\n\n"
-    "    public int touch(List<String> names) {\n"
-    "        dsl.select(\"a\");\n"
-    "        return names.size();\n"
+    "    public Invoice make() {\n"
+    "        return Invoice.builder().number(\"1\").paid(true).build();\n"
     "    }\n\n"
-    "    public String customerName(Customer c) {\n"
-    "        return c.getName();\n"
+    "    public int touch(Customer c) {\n"
+    "        var inv = new Invoice(\"x\", false, c);\n"
+    "        inv.setPaid(true);\n"
+    "        c.describe();\n"
+    "        c.describe(\"p\");\n"
+    "        audit();\n"
+    "        dsl.select(\"a\");\n"
+    "        return invoices.all().size();\n"
     "    }\n\n"
     "    public String branchCity(com.acme.model.Branch b) {\n"
     "        return b.getCity();\n"
@@ -76,7 +147,11 @@ static const char *const JT_SERVICE =
     "}\n";
 
 static void jt_write_fixture(const char *tmp, int filler) {
+    th_write_file(TH_PATH(tmp, "src/main/java/com/acme/model/Invoice.java"), JT_INVOICE);
     th_write_file(TH_PATH(tmp, "src/main/java/com/acme/model/Customer.java"), JT_CUSTOMER);
+    th_write_file(TH_PATH(tmp, "src/main/java/com/acme/model/Address.java"), JT_ADDRESS);
+    th_write_file(TH_PATH(tmp, "src/main/java/com/acme/model/Repo.java"), JT_REPO);
+    th_write_file(TH_PATH(tmp, "src/main/java/com/acme/model/Base.java"), JT_BASE);
     th_write_file(TH_PATH(tmp, "src/main/java/com/acme/other/Filters.java"), JT_FILTERS);
     th_write_file(TH_PATH(tmp, "src/main/java/com/acme/svc/InvoiceService.java"), JT_SERVICE);
     for (int i = 0; i < filler; i++) {
@@ -252,19 +327,45 @@ static char *jt_edge_set(jt_index_t *ix) {
 
 /* ── Tests ───────────────────────────────────────────────────────── */
 
+static int jt_check_receivers(jt_index_t *ix) {
+    int ok = 1;
+    /* A field typed by a project generic interface; its type argument flows
+     * into the return of first() and on through the getters. */
+    ok &= jt_expect(ix, "customerName", "find", "com.acme.model.Repo.find");
+    ok &= jt_expect(ix, "city", "first", "com.acme.model.Repo.first");
+    ok &= jt_expect(ix, "city", "getCustomer", "com.acme.model.Invoice.getCustomer");
+    ok &= jt_expect(ix, "city", "getAddress", "com.acme.model.Customer.getAddress");
+    ok &= jt_expect(ix, "city", "getCity", "com.acme.model.Address.getCity");
+    /* A lambda parameter bound through Optional<Invoice>.map. */
+    ok &= jt_expect(ix, "customerName", "getName", "com.acme.model.Customer.getName");
+    /* `var x = new X(...)`, a parameter, and an inherited bare call. */
+    ok &= jt_expect(ix, "touch", "setPaid", "com.acme.model.Invoice.setPaid");
+    ok &= jt_expect(ix, "touch", "describe", "com.acme.model.Customer.describe");
+    ok &= jt_expect(ix, "touch", "audit", "com.acme.model.Base.audit");
+    return ok;
+}
+
+static int jt_check_builder(jt_index_t *ix) {
+    int ok = 1;
+    ok &= jt_expect(ix, "make", "builder", "com.acme.model.Invoice.builder");
+    ok &= jt_expect(ix, "make", "number", "com.acme.model.Invoice.InvoiceBuilder.number");
+    ok &= jt_expect(ix, "make", "paid", "com.acme.model.Invoice.InvoiceBuilder.paid");
+    ok &= jt_expect(ix, "make", "build", "com.acme.model.Invoice.InvoiceBuilder.build");
+    return ok;
+}
+
 static int jt_check_external(jt_index_t *ix) {
     int ok = 1;
     /* JDK and library receivers never bind a project method by name... */
     ok &= jt_expect_none_to(ix, "numbers", "filter", "Filters");
     ok &= jt_expect_none_to(ix, "numbers", "map", "Filters");
+    ok &= jt_expect_none_to(ix, "customerName", "map", "Filters");
     ok &= jt_expect_none_to(ix, "touch", "select", "Filters");
     ok &= jt_expect_none_to(ix, "touch", "size", "Filters");
     /* ...and get no edge: the graph holds no node for a library method. */
     ok &= jt_expect_no_edge(ix, "numbers", "filter");
     ok &= jt_expect_no_edge(ix, "touch", "select");
     ok &= jt_expect_no_edge(ix, "touch", "size");
-    /* A project receiver keeps its edge. */
-    ok &= jt_expect(ix, "customerName", "getName", "com.acme.model.Customer.getName");
     /* An unknown type in a project package is not proven external. */
     ok &= jt_expect_some_edge(ix, "branchCity", "getCity");
     return ok;
@@ -277,7 +378,10 @@ static int jt_run_all(int filler) {
         jt_close(&ix);
         return 0;
     }
-    int ok = jt_check_external(&ix);
+    int ok = 1;
+    ok &= jt_check_receivers(&ix);
+    ok &= jt_check_builder(&ix);
+    ok &= jt_check_external(&ix);
     jt_close(&ix);
     return ok;
 }
